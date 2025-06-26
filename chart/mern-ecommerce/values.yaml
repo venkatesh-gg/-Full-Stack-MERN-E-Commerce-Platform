@@ -1,0 +1,108 @@
+# Default values for mern-ecommerce
+replicaCount:
+  server: 2
+  client: 2
+
+image:
+  server:
+    repository: ecommerce-server
+    pullPolicy: IfNotPresent
+    tag: "latest"
+  client:
+    repository: ecommerce-client
+    pullPolicy: IfNotPresent
+    tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+
+service:
+  server:
+    type: ClusterIP
+    port: 5000
+  client:
+    type: ClusterIP
+    port: 3000
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: localhost
+      paths:
+        - path: /api
+          pathType: Prefix
+          service: server
+        - path: /
+          pathType: Prefix
+          service: client
+  tls: []
+
+resources:
+  server:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  client:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+
+autoscaling:
+  server:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  client:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# MongoDB configuration
+mongodb:
+  enabled: true
+  auth:
+    enabled: true
+    rootUsername: admin
+    rootPassword: password123
+  persistence:
+    enabled: true
+    size: 5Gi
+
+# Application configuration
+config:
+  server:
+    nodeEnv: production
+    jwtSecret: your-super-secret-jwt-key-change-this-in-production
+  client:
+    apiUrl: http://ecommerce-server-service:5000/api
+    stripePublishableKey: pk_test_your_stripe_key_here

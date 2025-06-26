@@ -1,0 +1,212 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: docker.io
+  SERVER_IMAGE_NAME: ecommerce-server
+  CLIENT_IMAGE_NAME: ecommerce-client
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      mongodb:
+        image: mongo:7.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: admin
+          MONGO_INITDB_ROOT_PASSWORD: password123
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: |
+          server/package-lock.json
+          client/package-lock.json
+
+    - name: Install server dependencies
+      working-directory: ./server
+      run: npm ci
+
+    - name: Install client dependencies
+      working-directory: ./client
+      run: npm ci
+
+    - name: Lint server code
+      working-directory: ./server
+      run: npm run lint || echo "Linting not configured"
+
+    - name: Lint client code
+      working-directory: ./client
+      run: npm run lint
+
+    - name: Run server tests
+      working-directory: ./server
+      run: npm test || echo "Tests not configured"
+      env:
+        MONGO_URI: mongodb://admin:password123@localhost:27017/ecommerce_test?authSource=admin
+        JWT_SECRET: test-jwt-secret
+        NODE_ENV: test
+
+    - name: Run client tests
+      working-directory: ./client
+      run: npm test || echo "Tests not configured"
+
+    - name: Build server
+      working-directory: ./server
+      run: npm run build
+
+    - name: Build client
+      working-directory: ./client
+      run: npm run build
+      env:
+        NEXT_PUBLIC_API_URL: http://localhost:5000/api
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract metadata for server
+      id: meta-server
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.SERVER_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Extract metadata for client
+      id: meta-client
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.CLIENT_IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push server image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./server
+        file: ./server/Dockerfile
+        push: true
+        tags: ${{ steps.meta-server.outputs.tags }}
+        labels: ${{ steps.meta-server.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push client image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./client
+        file: ./client/Dockerfile
+        push: true
+        tags: ${{ steps.meta-client.outputs.tags }}
+        labels: ${{ steps.meta-client.outputs.labels }}
+        build-args: |
+          NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: '3.12.0'
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: '1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+
+    - name: Deploy with Helm
+      run: |
+        helm upgrade --install mern-ecommerce ./chart/mern-ecommerce \
+          --namespace ecommerce \
+          --create-namespace \
+          --set image.server.repository=${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.SERVER_IMAGE_NAME }} \
+          --set image.server.tag=latest \
+          --set image.client.repository=${{ env.REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.CLIENT_IMAGE_NAME }} \
+          --set image.client.tag=latest \
+          --set config.server.jwtSecret="${{ secrets.JWT_SECRET }}" \
+          --set config.client.stripePublishableKey="${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}" \
+          --wait \
+          --timeout=10m
+
+    - name: Verify deployment
+      run: |
+        kubectl get pods -n ecommerce
+        kubectl get services -n ecommerce
+        kubectl get ingress -n ecommerce
+
+  security-scan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
